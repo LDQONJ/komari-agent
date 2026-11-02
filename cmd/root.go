@@ -26,11 +26,18 @@ import (
 
 var flags = pkg_flags.GlobalConfig
 
+var warningPanelHost, warningRunAsUser string
+
 var RootCmd = &cobra.Command{
 	Use:   "komari-agent",
 	Short: "komari agent",
 	Long:  `komari agent`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// Notification helpers must not load the service's config or credentials.
+		if flags.ShowWarning {
+			ShowToast()
+			return nil
+		}
 		loadFromEnv() // 从环境变量加载配置，覆盖解析
 		if flags.ConfigFile != "" {
 			bytes, err := os.ReadFile(flags.ConfigFile)
@@ -48,21 +55,15 @@ var RootCmd = &cobra.Command{
 		// 捕获中止信号，优雅退出
 		stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
+
+		stopWarning := startSecurityWarning(stopCtx)
+		defer stopWarning()
+		shutdown := newShutdownCoordinator(stopWarning, netstatic.Stop, os.Exit)
 		go func() {
 			<-stopCtx.Done()
 			log.Printf("shutting down gracefully...")
-			netstatic.Stop()
-			os.Exit(0)
+			shutdown.shutdown(0)
 		}()
-
-		if flags.ShowWarning {
-			ShowToast()
-			os.Exit(0)
-		}
-
-		if !flags.DisableWebSsh {
-			go WarnKomariRunning()
-		}
 
 		if flags.MonthRotate != 0 {
 			err := netstatic.StartOrContinue()
@@ -100,6 +101,12 @@ var RootCmd = &cobra.Command{
 				return fmt.Errorf("auto-discovery failed: %w", err)
 			}
 		}
+		if err := pkg_flags.CaptureStartupConfig(map[string]interface{}{
+			"warning_panel_host":  warningPanelHost,
+			"warning_run_as_user": warningRunAsUser,
+		}); err != nil {
+			return fmt.Errorf("failed to capture startup configuration: %w", err)
+		}
 		diskList, err := monitoring.DiskList()
 		if err != nil {
 			log.Println("Failed to get disk list:", err)
@@ -115,18 +122,18 @@ var RootCmd = &cobra.Command{
 		if flags.IgnoreUnsafeCert {
 			http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 		}
-		// 自动更新
+		// 自动更新：后台立即检查一次并按周期复查，避免启动被 GitHub 访问阻塞
 		if !flags.DisableAutoUpdate {
-			err := update.CheckAndUpdate()
-			if err != nil {
-				log.Println("[ERROR]", err)
-			}
-			go update.DoUpdateWorks()
+			go update.DoUpdateWorks(func() {
+				shutdown.shutdown(42)
+			})
 		}
 		go server.DoUploadBasicInfoWorks()
 		for {
 			server.UpdateBasicInfo()
-			server.EstablishWebSocketConnection()
+			server.EstablishWebSocketConnection(func() {
+				shutdown.shutdown(42)
+			})
 		}
 	},
 }
@@ -175,6 +182,10 @@ func init() {
 	RootCmd.PersistentFlags().StringVar(&flags.CustomDNS, "custom-dns", "", "Custom DNS server to use (e.g. 8.8.8.8, 114.114.114.114). By default, the program uses the system DNS resolver.")
 	RootCmd.PersistentFlags().BoolVar(&flags.EnableGPU, "gpu", false, "Enable detailed GPU monitoring (usage, memory, multi-GPU support)")
 	RootCmd.PersistentFlags().BoolVar(&flags.ShowWarning, "show-warning", false, "Show security warning on Windows, run once as a subprocess")
+	RootCmd.PersistentFlags().StringVar(&warningPanelHost, "warning-panel-host", "", "Panel host shown by the notification helper")
+	RootCmd.PersistentFlags().StringVar(&warningRunAsUser, "warning-run-as-user", "", "Agent account shown by the notification helper")
+	_ = RootCmd.PersistentFlags().MarkHidden("warning-panel-host")
+	_ = RootCmd.PersistentFlags().MarkHidden("warning-run-as-user")
 	RootCmd.PersistentFlags().StringVar(&flags.CustomIpv4, "custom-ipv4", "", "Custom IPv4 address to use")
 	RootCmd.PersistentFlags().StringVar(&flags.CustomIpv6, "custom-ipv6", "", "Custom IPv6 address to use")
 	RootCmd.PersistentFlags().BoolVar(&flags.GetIpAddrFromNic, "get-ip-addr-from-nic", false, "Get IP address from network interface")
