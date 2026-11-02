@@ -14,6 +14,8 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"math/rand/v2"
+	"net/url"
 	"time"
 
 	"github.com/komari-monitor/komari-agent/dnsresolver"
@@ -160,7 +162,9 @@ func icmpPing(target string, timeout time.Duration) (int64, error) {
 	if err != nil {
 		return -1, err
 	}
-	pinger.Count = 1
+	// 发送 3 个包：第 1 包作为预热包（唤醒 NAT / EasyTier 隧道 / 路由表），后 2 包测量稳定延迟
+	pinger.Count = 3
+	pinger.Interval = 100 * time.Millisecond
 	pinger.Timeout = timeout
 	pinger.SetPrivileged(true)
 	err = pinger.Run()
@@ -171,7 +175,19 @@ func icmpPing(target string, timeout time.Duration) (int64, error) {
 	if stats.PacketsRecv == 0 {
 		return -1, errors.New("no packets received")
 	}
-	return stats.AvgRtt.Milliseconds(), nil
+
+	// 预热机制：若收到多个包，排除首个预热包，取后续包的最小延迟
+	if len(stats.Rtts) > 1 {
+		minRtt := stats.Rtts[1]
+		for _, rtt := range stats.Rtts[2:] {
+			if rtt < minRtt {
+				minRtt = rtt
+			}
+		}
+		return minRtt.Milliseconds(), nil
+	}
+	// 若只收到 1 个包，兜底使用该包
+	return stats.Rtts[0].Milliseconds(), nil
 }
 
 func tcpPing(target string, timeout time.Duration) (int64, error) {
@@ -191,6 +207,17 @@ func tcpPing(target string, timeout time.Duration) (int64, error) {
 	}
 
 	targetAddr := net.JoinHostPort(ip, port)
+
+	// 预热连接（Warm-up）：预先进行一次快速握手唤醒 NAT 映射或 EasyTier P2P 隧道
+	warmupTimeout := 1 * time.Second
+	if timeout < warmupTimeout {
+		warmupTimeout = timeout
+	}
+	if warmupConn, err := net.DialTimeout("tcp", targetAddr, warmupTimeout); err == nil {
+		_ = warmupConn.Close()
+		time.Sleep(30 * time.Millisecond)
+	}
+
 	start := time.Now()
 	conn, err := net.DialTimeout("tcp", targetAddr, timeout)
 	if err != nil {
@@ -211,6 +238,28 @@ func httpPing(target string, timeout time.Duration) (int64, error) {
 
 	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
 		target = "http://" + target
+	}
+
+	// 预热握手（Warm-up）：预先对目标 host:port 握手，消除 NAT / EasyTier 隧道冷启动
+	if u, parseErr := url.Parse(target); parseErr == nil {
+		port := u.Port()
+		if port == "" {
+			if strings.EqualFold(u.Scheme, "https") {
+				port = "443"
+			} else {
+				port = "80"
+			}
+		}
+		if ip, err := resolveIP(u.Hostname()); err == nil {
+			warmupTimeout := 1 * time.Second
+			if timeout < warmupTimeout {
+				warmupTimeout = timeout
+			}
+			if warmupConn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), warmupTimeout); err == nil {
+				_ = warmupConn.Close()
+				time.Sleep(30 * time.Millisecond)
+			}
+		}
 	}
 
 	transport := &http.Transport{
@@ -252,6 +301,11 @@ func NewPingTask(conn *ws.SafeConn, taskID uint, pingType, pingTarget string) {
 		log.Printf("Invalid task ID: %d", taskID)
 		return
 	}
+
+	// 随机延时运行（Jitter: 0 ~ 1000ms），打散同时收到的并发任务，避免网卡队列和本地路由器瞬时排队
+	jitter := time.Duration(rand.IntN(1000)) * time.Millisecond
+	time.Sleep(jitter)
+
 	var err error = nil
 	var latency int64
 	pingResult := -1
