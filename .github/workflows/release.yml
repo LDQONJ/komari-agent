@@ -1,19 +1,53 @@
 name: Release Binaries
 
 on:
+  push:
+    tags:
+      - "[0-9]*.[0-9]*.[0-9]*"
+      - "v[0-9]*"
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (defaults to ref name)"
+        required: false
+        type: string
 
 permissions:
   contents: write
 
 jobs:
+  prepare:
+    if: ${{ github.event_name != 'release' || !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Resolve Release Tag
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          if [ "$EVENT_NAME" = "release" ]; then
+            TAG="$RELEASE_TAG"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="$REF_NAME"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
   build-and-attach:
-    if: ${{ !github.event.release.prerelease }}
+    needs: prepare
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
         goos: [windows, linux]
         goarch: [amd64, arm64]
@@ -21,6 +55,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -32,21 +68,40 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
-          VERSION: ${{ github.event.release.tag_name }}
+          VERSION: ${{ needs.prepare.outputs.tag }}
         run: |
+          mkdir -p dist
           BINARY_NAME=komari-agent-${{ matrix.goos }}-${{ matrix.goarch }}
           if [ "${{ matrix.goos }}" = "windows" ]; then
             BINARY_NAME=${BINARY_NAME}.exe
           fi
-          go build -trimpath -ldflags="-s -w -X github.com/komari-monitor/komari-agent/update.CurrentVersion=${VERSION}" -o $BINARY_NAME
+          go build -trimpath -ldflags="-s -w -X github.com/komari-monitor/komari-agent/update.CurrentVersion=${VERSION}" -o "dist/${BINARY_NAME}"
 
-      - name: Upload binary to release
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: komari-agent-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/komari-agent-${{ matrix.goos }}-${{ matrix.goarch }}*
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build-and-attach]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Ensure Release and Upload Binaries
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          BINARY_NAME=komari-agent-${{ matrix.goos }}-${{ matrix.goarch }}
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            BINARY_NAME=${BINARY_NAME}.exe
+          set -eu
+          if ! gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GH_REPO" --title "$TAG" --generate-notes --target "$GITHUB_SHA"
           fi
-          gh release upload ${{ github.event.release.tag_name }} $BINARY_NAME --repo ${{ github.repository }}
-        shell: bash
+          gh release upload "$TAG" dist/* --repo "$GH_REPO" --clobber
